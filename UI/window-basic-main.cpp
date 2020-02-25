@@ -206,6 +206,10 @@ OBSBasic::OBSBasic(QWidget *parent)
 
 	setAcceptDrops(true);
 
+	setContextMenuPolicy(Qt::CustomContextMenu);
+	connect(this, SIGNAL(customContextMenuRequested(const QPoint &)), this,
+		SLOT(on_customContextMenuRequested(const QPoint &)));
+
 	api = InitializeAPIInterface(this);
 
 	ui->setupUi(this);
@@ -429,7 +433,7 @@ static obs_data_t *GenerateSaveData(obs_data_array_t *sceneOrder,
 	obs_data_t *saveData = obs_data_create();
 
 	vector<OBSSource> audioSources;
-	audioSources.reserve(5);
+	audioSources.reserve(6);
 
 	SaveAudioDevice(DESKTOP_AUDIO_1, 1, saveData, audioSources);
 	SaveAudioDevice(DESKTOP_AUDIO_2, 2, saveData, audioSources);
@@ -1416,7 +1420,7 @@ void OBSBasic::InitOBSCallbacks()
 {
 	ProfileScope("OBSBasic::InitOBSCallbacks");
 
-	signalHandlers.reserve(signalHandlers.size() + 6);
+	signalHandlers.reserve(signalHandlers.size() + 7);
 	signalHandlers.emplace_back(obs_get_signal_handler(), "source_create",
 				    OBSBasic::SourceCreated, this);
 	signalHandlers.emplace_back(obs_get_signal_handler(), "source_remove",
@@ -2838,11 +2842,37 @@ void OBSBasic::MixerRenameSource()
 	}
 }
 
+static inline bool SourceVolumeLocked(obs_source_t *source)
+{
+	obs_data_t *priv_settings = obs_source_get_private_settings(source);
+	bool lock = obs_data_get_bool(priv_settings, "volume_locked");
+	obs_data_release(priv_settings);
+
+	return lock;
+}
+
+void OBSBasic::LockVolumeControl(bool lock)
+{
+	QAction *action = reinterpret_cast<QAction *>(sender());
+	VolControl *vol = action->property("volControl").value<VolControl *>();
+	obs_source_t *source = vol->GetSource();
+
+	obs_data_t *priv_settings = obs_source_get_private_settings(source);
+	obs_data_set_bool(priv_settings, "volume_locked", lock);
+	obs_data_release(priv_settings);
+
+	vol->EnableSlider(!lock);
+}
+
 void OBSBasic::VolControlContextMenu()
 {
 	VolControl *vol = reinterpret_cast<VolControl *>(sender());
 
 	/* ------------------- */
+
+	QAction lockAction(QTStr("LockVolume"), this);
+	lockAction.setCheckable(true);
+	lockAction.setChecked(SourceVolumeLocked(vol->GetSource()));
 
 	QAction hideAction(QTStr("Hide"), this);
 	QAction unhideAllAction(QTStr("UnhideAll"), this);
@@ -2866,6 +2896,8 @@ void OBSBasic::VolControlContextMenu()
 		&OBSBasic::HideAudioControl, Qt::DirectConnection);
 	connect(&unhideAllAction, &QAction::triggered, this,
 		&OBSBasic::UnhideAllAudioControls, Qt::DirectConnection);
+	connect(&lockAction, &QAction::toggled, this,
+		&OBSBasic::LockVolumeControl, Qt::DirectConnection);
 	connect(&mixerRenameAction, &QAction::triggered, this,
 		&OBSBasic::MixerRenameSource, Qt::DirectConnection);
 
@@ -2891,6 +2923,8 @@ void OBSBasic::VolControlContextMenu()
 
 	hideAction.setProperty("volControl",
 			       QVariant::fromValue<VolControl *>(vol));
+	lockAction.setProperty("volControl",
+			       QVariant::fromValue<VolControl *>(vol));
 	mixerRenameAction.setProperty("volControl",
 				      QVariant::fromValue<VolControl *>(vol));
 
@@ -2912,6 +2946,8 @@ void OBSBasic::VolControlContextMenu()
 		pasteFiltersAction.setEnabled(true);
 
 	QMenu popup;
+	popup.addAction(&lockAction);
+	popup.addSeparator();
 	popup.addAction(&unhideAllAction);
 	popup.addAction(&hideAction);
 	popup.addAction(&mixerRenameAction);
@@ -3014,6 +3050,8 @@ void OBSBasic::ActivateAudioSource(OBSSource source)
 	bool vertical = config_get_bool(GetGlobalConfig(), "BasicWindow",
 					"VerticalVolControl");
 	VolControl *vol = new VolControl(source, true, vertical);
+
+	vol->EnableSlider(!SourceVolumeLocked(source));
 
 	double meterDecayRate =
 		config_get_double(basicConfig, "Audio", "MeterDecayRate");
@@ -3878,6 +3916,7 @@ void OBSBasic::closeEvent(QCloseEvent *event)
 
 		if (button == QMessageBox::No) {
 			event->ignore();
+			restart = false;
 			return;
 		}
 	}
@@ -4008,6 +4047,16 @@ void OBSBasic::on_action_Settings_triggered()
 	SystemTray(false);
 
 	settings_already_executing = false;
+
+	if (restart) {
+		QMessageBox::StandardButton button = OBSMessageBox::question(
+			this, QTStr("Restart"), QTStr("NeedsRestart"));
+
+		if (button == QMessageBox::Yes)
+			close();
+		else
+			restart = false;
+	}
 }
 
 void OBSBasic::on_actionAdvAudioProperties_triggered()
@@ -4532,6 +4581,7 @@ void OBSBasic::CreateSourcePopupMenu(int idx, bool preview)
 			popup.addSeparator();
 
 		OBSSceneItem sceneItem = ui->sources->Get(idx);
+		bool lock = obs_sceneitem_locked(sceneItem);
 		obs_source_t *source = obs_sceneitem_get_source(sceneItem);
 		uint32_t flags = obs_source_get_output_flags(source);
 		bool isAsyncVideo = (flags & OBS_SOURCE_ASYNC_VIDEO) ==
@@ -4551,6 +4601,18 @@ void OBSBasic::CreateSourcePopupMenu(int idx, bool preview)
 		popup.addSeparator();
 		popup.addMenu(ui->orderMenu);
 		popup.addMenu(ui->transformMenu);
+
+		ui->actionResetTransform->setEnabled(!lock);
+		ui->actionRotate90CW->setEnabled(!lock);
+		ui->actionRotate90CCW->setEnabled(!lock);
+		ui->actionRotate180->setEnabled(!lock);
+		ui->actionFlipHorizontal->setEnabled(!lock);
+		ui->actionFlipVertical->setEnabled(!lock);
+		ui->actionFitToScreen->setEnabled(!lock);
+		ui->actionStretchToScreen->setEnabled(!lock);
+		ui->actionCenterToScreen->setEnabled(!lock);
+		ui->actionVerticalCenter->setEnabled(!lock);
+		ui->actionHorizontalCenter->setEnabled(!lock);
 
 		sourceProjector = new QMenu(QTStr("SourceProjector"));
 		AddProjectorMenuMonitors(sourceProjector, this,
@@ -6150,6 +6212,8 @@ static bool reset_tr(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
 		obs_sceneitem_group_enum_items(item, reset_tr, nullptr);
 	if (!obs_sceneitem_selected(item))
 		return true;
+	if (obs_sceneitem_locked(item))
+		return true;
 
 	obs_sceneitem_defer_update_begin(item);
 
@@ -6227,6 +6291,8 @@ static bool RotateSelectedSources(obs_scene_t *scene, obs_sceneitem_t *item,
 					       param);
 	if (!obs_sceneitem_selected(item))
 		return true;
+	if (obs_sceneitem_locked(item))
+		return true;
 
 	float rot = *reinterpret_cast<float *>(param);
 
@@ -6275,6 +6341,8 @@ static bool MultiplySelectedItemScale(obs_scene_t *scene, obs_sceneitem_t *item,
 					       param);
 	if (!obs_sceneitem_selected(item))
 		return true;
+	if (obs_sceneitem_locked(item))
+		return true;
 
 	vec3 tl = GetItemTL(item);
 
@@ -6317,6 +6385,8 @@ static bool CenterAlignSelectedItems(obs_scene_t *scene, obs_sceneitem_t *item,
 		obs_sceneitem_group_enum_items(item, CenterAlignSelectedItems,
 					       param);
 	if (!obs_sceneitem_selected(item))
+		return true;
+	if (obs_sceneitem_locked(item))
 		return true;
 
 	obs_video_info ovi;
@@ -6371,6 +6441,8 @@ static bool center_to_scene(obs_scene_t *, obs_sceneitem_t *item, void *param)
 		obs_sceneitem_group_enum_items(item, center_to_scene,
 					       &centerType);
 	if (!obs_sceneitem_selected(item))
+		return true;
+	if (obs_sceneitem_locked(item))
 		return true;
 
 	obs_get_video_info(&ovi);
@@ -7772,4 +7844,15 @@ void OBSBasic::ResetStatsHotkey()
 	QList<OBSBasicStats *> list = findChildren<OBSBasicStats *>();
 
 	foreach(OBSBasicStats * s, list) s->Reset();
+}
+
+void OBSBasic::on_customContextMenuRequested(const QPoint &pos)
+{
+	QWidget *widget = childAt(pos);
+	const char *className = nullptr;
+	if (widget != nullptr)
+		className = widget->metaObject()->className();
+
+	if (!className || strstr(className, "Dock") != nullptr)
+		ui->viewMenuDocks->exec(mapToGlobal(pos));
 }

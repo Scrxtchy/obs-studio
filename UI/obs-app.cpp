@@ -34,6 +34,7 @@
 #include <QGuiApplication>
 #include <QProxyStyle>
 #include <QScreen>
+#include <QProcess>
 
 #include "qt-wrappers.hpp"
 #include "obs-app.hpp"
@@ -82,6 +83,8 @@ string opt_starting_scene;
 
 bool remuxAfterRecord = false;
 string remuxFilename;
+
+bool restart = false;
 
 // GPU hint exports for AMD/NVIDIA laptops
 #ifdef _MSC_VER
@@ -1848,12 +1851,16 @@ static int run_program(fstream &logFile, int argc, char *argv[])
 
 		prof.Stop();
 
-		return program.exec();
+		ret = program.exec();
 
 	} catch (const char *error) {
 		blog(LOG_ERROR, "%s", error);
 		OBSErrorBox(nullptr, "%s", error);
 	}
+
+	if (restart)
+		QProcess::startDetached(qApp->arguments()[0],
+					qApp->arguments());
 
 	return ret;
 }
