@@ -1724,7 +1724,8 @@ void OBSBasic::OBSInit()
 	if (cef) {
 		QAction *action = new QAction(QTStr("Basic.MainMenu."
 						    "View.Docks."
-						    "CustomBrowserDocks"));
+						    "CustomBrowserDocks"),
+					      this);
 		ui->viewMenuDocks->insertAction(ui->toggleScenes, action);
 		connect(action, &QAction::triggered, this,
 			&OBSBasic::ManageExtraBrowserDocks);
@@ -3976,7 +3977,7 @@ void OBSBasic::changeEvent(QEvent *event)
 
 			if (previewEnabled)
 				EnablePreviewDisplay(false);
-		} else if (stateEvent->oldState() == Qt::WindowMinimized &&
+		} else if (stateEvent->oldState() & Qt::WindowMinimized &&
 			   isVisible()) {
 			if (previewEnabled)
 				EnablePreviewDisplay(true);

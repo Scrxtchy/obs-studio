@@ -10,6 +10,7 @@
 #include "obfuscate.h"
 #include "inject-library.h"
 #include "graphics-hook-info.h"
+#include "graphics-hook-ver.h"
 #include "window-helpers.h"
 #include "cursor-capture.h"
 #include "app-helpers.h"
@@ -893,23 +894,22 @@ static inline bool create_inject_process(struct game_capture *gc,
 	return success;
 }
 
+extern char *get_hook_path(bool b64);
+
 static inline bool inject_hook(struct game_capture *gc)
 {
 	bool matching_architecture;
 	bool success = false;
-	const char *hook_dll;
 	char *inject_path;
 	char *hook_path;
 
 	if (gc->process_is_64bit) {
-		hook_dll = "graphics-hook64.dll";
 		inject_path = obs_module_file("inject-helper64.exe");
 	} else {
-		hook_dll = "graphics-hook32.dll";
 		inject_path = obs_module_file("inject-helper32.exe");
 	}
 
-	hook_path = obs_module_file(hook_dll);
+	hook_path = get_hook_path(gc->process_is_64bit);
 
 	if (!check_file_integrity(gc, inject_path, "inject helper")) {
 		goto cleanup;
@@ -930,7 +930,7 @@ static inline bool inject_hook(struct game_capture *gc)
 	} else {
 		info("using helper (%s hook)",
 		     use_anticheat(gc) ? "compatibility" : "direct");
-		success = create_inject_process(gc, inject_path, hook_dll);
+		success = create_inject_process(gc, inject_path, hook_path);
 	}
 
 cleanup:
@@ -1251,8 +1251,13 @@ static inline enum capture_result init_capture_data(struct game_capture *gc)
 
 	CloseHandle(gc->hook_data_map);
 
-	gc->hook_data_map = open_map_plus_id(gc, SHMEM_TEXTURE,
-					     gc->global_hook_info->map_id);
+	wchar_t name[64];
+	_snwprintf(name, 64, L"%s_%d_", SHMEM_TEXTURE,
+		   (uint32_t)(uintptr_t)gc->window);
+
+	gc->hook_data_map =
+		open_map_plus_id(gc, name, gc->global_hook_info->map_id);
+
 	if (!gc->hook_data_map) {
 		DWORD error = GetLastError();
 		if (error == 2) {
@@ -1606,6 +1611,17 @@ static bool start_capture(struct game_capture *gc)
 {
 	debug("Starting capture");
 
+	/* prevent from using a DLL version that's higher than current */
+	if (gc->global_hook_info->hook_ver_major > HOOK_VER_MAJOR) {
+		warn("cannot initialize hook, DLL hook version is "
+		     "%" PRIu32 ".%" PRIu32
+		     ", current plugin hook major version is %d.%d",
+		     gc->global_hook_info->hook_ver_major,
+		     gc->global_hook_info->hook_ver_minor, HOOK_VER_MAJOR,
+		     HOOK_VER_MINOR);
+		return false;
+	}
+
 	if (gc->global_hook_info->type == CAPTURE_TYPE_MEMORY) {
 		if (!init_shmem_capture(gc)) {
 			return false;
@@ -1899,7 +1915,7 @@ static bool use_scaling_callback(obs_properties_t *ppts, obs_property_t *p,
 	return true;
 }
 
-static void insert_preserved_val(obs_property_t *p, const char *val)
+static void insert_preserved_val(obs_property_t *p, const char *val, size_t idx)
 {
 	char *class = NULL;
 	char *title = NULL;
@@ -1909,8 +1925,8 @@ static void insert_preserved_val(obs_property_t *p, const char *val)
 	build_window_strings(val, &class, &title, &executable);
 
 	dstr_printf(&desc, "[%s]: %s", executable, title);
-	obs_property_list_insert_string(p, 1, desc.array, val);
-	obs_property_list_item_disable(p, 1, true);
+	obs_property_list_insert_string(p, idx, desc.array, val);
+	obs_property_list_item_disable(p, idx, true);
 
 	dstr_free(&desc);
 	bfree(class);
@@ -1918,14 +1934,15 @@ static void insert_preserved_val(obs_property_t *p, const char *val)
 	bfree(executable);
 }
 
-static bool window_changed_callback(obs_properties_t *ppts, obs_property_t *p,
-				    obs_data_t *settings)
+bool check_window_property_setting(obs_properties_t *ppts, obs_property_t *p,
+				   obs_data_t *settings, const char *val,
+				   size_t idx)
 {
 	const char *cur_val;
 	bool match = false;
 	size_t i = 0;
 
-	cur_val = obs_data_get_string(settings, SETTING_CAPTURE_WINDOW);
+	cur_val = obs_data_get_string(settings, val);
 	if (!cur_val) {
 		return false;
 	}
@@ -1942,12 +1959,19 @@ static bool window_changed_callback(obs_properties_t *ppts, obs_property_t *p,
 	}
 
 	if (cur_val && *cur_val && !match) {
-		insert_preserved_val(p, cur_val);
+		insert_preserved_val(p, cur_val, idx);
 		return true;
 	}
 
 	UNUSED_PARAMETER(ppts);
 	return false;
+}
+
+static bool window_changed_callback(obs_properties_t *ppts, obs_property_t *p,
+				    obs_data_t *settings)
+{
+	return check_window_property_setting(ppts, p, settings,
+					     SETTING_CAPTURE_WINDOW, 1);
 }
 
 static const double default_scale_vals[] = {1.25, 1.5, 2.0, 2.5, 3.0};
