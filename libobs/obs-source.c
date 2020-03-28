@@ -51,6 +51,19 @@ struct obs_source_info *get_source_info(const char *id)
 	return NULL;
 }
 
+struct obs_source_info *get_source_info2(const char *unversioned_id,
+					 uint32_t ver)
+{
+	for (size_t i = 0; i < obs->source_types.num; i++) {
+		struct obs_source_info *info = &obs->source_types.array[i];
+		if (strcmp(info->unversioned_id, unversioned_id) == 0 &&
+		    info->version == ver)
+			return info;
+	}
+
+	return NULL;
+}
+
 static const char *source_signals[] = {
 	"void destroy(ptr source)",
 	"void remove(ptr source)",
@@ -328,6 +341,7 @@ obs_source_create_internal(const char *id, const char *name,
 
 		source->info.id = bstrdup(id);
 		source->owns_info_id = true;
+		source->info.unversioned_id = bstrdup(source->info.id);
 	} else {
 		source->info = *info;
 
@@ -648,8 +662,10 @@ void obs_source_destroy(struct obs_source *source)
 	obs_data_release(source->private_settings);
 	obs_context_data_free(&source->context);
 
-	if (source->owns_info_id)
+	if (source->owns_info_id) {
 		bfree((void *)source->info.id);
+		bfree((void *)source->info.unversioned_id);
+	}
 
 	bfree(source);
 }
@@ -958,8 +974,6 @@ static void deactivate_source(obs_source_t *source)
 
 static void show_source(obs_source_t *source)
 {
-	obs_source_addref(source);
-
 	if (source->context.data && source->info.show)
 		source->info.show(source->context.data);
 	obs_source_dosignal(source, "source_show", "show");
@@ -970,8 +984,6 @@ static void hide_source(obs_source_t *source)
 	if (source->context.data && source->info.hide)
 		source->info.hide(source->context.data);
 	obs_source_dosignal(source, "source_hide", "hide");
-
-	obs_source_release(source);
 }
 
 static void activate_tree(obs_source_t *parent, obs_source_t *child,
@@ -2588,12 +2600,13 @@ static inline void copy_frame_data_plane(struct obs_source_frame *dst,
 					 const struct obs_source_frame *src,
 					 uint32_t plane, uint32_t lines)
 {
-	if (dst->linesize[plane] != src->linesize[plane])
+	if (dst->linesize[plane] != src->linesize[plane]) {
 		for (uint32_t y = 0; y < lines; y++)
 			copy_frame_data_line(dst, src, plane, y);
-	else
+	} else {
 		memcpy(dst->data[plane], src->data[plane],
-		       dst->linesize[plane] * lines);
+		       (size_t)dst->linesize[plane] * (size_t)lines);
+	}
 }
 
 static void copy_frame_data(struct obs_source_frame *dst,
@@ -3377,6 +3390,13 @@ const char *obs_source_get_id(const obs_source_t *source)
 {
 	return obs_source_valid(source, "obs_source_get_id") ? source->info.id
 							     : NULL;
+}
+
+const char *obs_source_get_unversioned_id(const obs_source_t *source)
+{
+	return obs_source_valid(source, "obs_source_get_unversioned_id")
+		       ? source->info.unversioned_id
+		       : NULL;
 }
 
 static inline void render_filter_bypass(obs_source_t *target,
@@ -4576,6 +4596,10 @@ void obs_source_audio_render(obs_source_t *source, uint32_t mixers,
 	}
 
 	if (source->info.audio_render) {
+		if (!source->context.data) {
+			source->audio_pending = true;
+			return;
+		}
 		custom_audio_render(source, mixers, channels, sample_rate);
 		return;
 	}

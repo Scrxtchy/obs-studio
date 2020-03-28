@@ -35,8 +35,6 @@
 /* use the loader's dispatch table pointer as a key for internal data maps */
 #define GET_LDT(x) (*(void **)x)
 
-#define DUMMY_WINDOW_CLASS_NAME L"graphics_hook_vk_dummy_window"
-
 /* clang-format off */
 static const GUID dxgi_factory1_guid =
 {0x770aae78, 0xf26f, 0x4dba, {0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}};
@@ -45,7 +43,7 @@ static const GUID dxgi_resource_guid =
 /* clang-format on */
 
 static bool vulkan_seen = false;
-static CRITICAL_SECTION mutex;
+static SRWLOCK mutex = SRWLOCK_INIT; // Faster CRITICAL_SECTION
 
 /* ======================================================================== */
 /* hook data                                                                */
@@ -54,7 +52,7 @@ struct vk_swap_data {
 	VkSwapchainKHR sc;
 	VkExtent2D image_extent;
 	VkFormat format;
-	VkSurfaceKHR surf;
+	HWND hwnd;
 	VkImage export_image;
 	bool layout_initialized;
 	VkDeviceMemory export_mem;
@@ -96,10 +94,10 @@ struct vk_data {
 	struct vk_cmd_pool_data cmd_pools[OBJ_MAX];
 	VkExternalMemoryProperties external_mem_props;
 
+	struct vk_inst_data *inst_data;
+
 	ID3D11Device *d3d11_device;
 	ID3D11DeviceContext *d3d11_context;
-	IDXGISwapChain *dxgi_swap;
-	HWND dummy_hwnd;
 };
 
 static struct vk_swap_data *get_swap_data(struct vk_data *data,
@@ -118,7 +116,7 @@ static struct vk_swap_data *get_swap_data(struct vk_data *data,
 static struct vk_swap_data *get_new_swap_data(struct vk_data *data)
 {
 	for (int i = 0; i < OBJ_MAX; i++) {
-		if (data->swaps[i].surf == NULL && data->swaps[i].sc == NULL) {
+		if (data->swaps[i].sc == VK_NULL_HANDLE) {
 			return &data->swaps[i];
 		}
 	}
@@ -133,14 +131,14 @@ static inline size_t find_obj_idx(void *objs[], void *obj)
 {
 	size_t idx = SIZE_MAX;
 
-	EnterCriticalSection(&mutex);
+	AcquireSRWLockExclusive(&mutex);
 	for (size_t i = 0; i < OBJ_MAX; i++) {
 		if (objs[i] == obj) {
 			idx = i;
 			break;
 		}
 	}
-	LeaveCriticalSection(&mutex);
+	ReleaseSRWLockExclusive(&mutex);
 
 	return idx;
 }
@@ -149,7 +147,7 @@ static size_t get_obj_idx(void *objs[], void *obj)
 {
 	size_t idx = SIZE_MAX;
 
-	EnterCriticalSection(&mutex);
+	AcquireSRWLockExclusive(&mutex);
 	for (size_t i = 0; i < OBJ_MAX; i++) {
 		if (objs[i] == obj) {
 			idx = i;
@@ -159,7 +157,7 @@ static size_t get_obj_idx(void *objs[], void *obj)
 			idx = i;
 		}
 	}
-	LeaveCriticalSection(&mutex);
+	ReleaseSRWLockExclusive(&mutex);
 	return idx;
 }
 
@@ -235,8 +233,8 @@ static void vk_shtex_free(struct vk_data *data)
 
 		swap->handle = INVALID_HANDLE_VALUE;
 		swap->d3d11_tex = NULL;
-		swap->export_mem = NULL;
-		swap->export_image = NULL;
+		swap->export_mem = VK_NULL_HANDLE;
+		swap->export_image = VK_NULL_HANDLE;
 
 		swap->captured = false;
 	}
@@ -248,10 +246,6 @@ static void vk_shtex_free(struct vk_data *data)
 	if (data->d3d11_device) {
 		ID3D11Device_Release(data->d3d11_device);
 		data->d3d11_device = NULL;
-	}
-	if (data->dxgi_swap) {
-		IDXGISwapChain_Release(data->dxgi_swap);
-		data->dxgi_swap = NULL;
 	}
 
 	data->cur_swap = NULL;
@@ -270,44 +264,79 @@ static void vk_remove_device(void *dev)
 
 	memset(data, 0, sizeof(*data));
 
-	EnterCriticalSection(&mutex);
+	AcquireSRWLockExclusive(&mutex);
 	devices[idx] = NULL;
-	LeaveCriticalSection(&mutex);
+	ReleaseSRWLockExclusive(&mutex);
 }
 
 /* ------------------------------------------------------------------------- */
 
 struct vk_surf_data {
 	VkSurfaceKHR surf;
-	HINSTANCE hinstance;
 	HWND hwnd;
+	struct vk_surf_data *next;
 };
 
 struct vk_inst_data {
 	bool valid;
 
 	struct vk_inst_funcs funcs;
-	struct vk_surf_data surfaces[OBJ_MAX];
+	struct vk_surf_data *surfaces;
 };
 
-static struct vk_surf_data *find_surf_data(struct vk_inst_data *data,
-					   VkSurfaceKHR surf)
+static void insert_surf_data(struct vk_inst_data *data, VkSurfaceKHR surf,
+			     HWND hwnd)
 {
-	int idx = OBJ_MAX;
-	for (int i = 0; i < OBJ_MAX; i++) {
-		if (data->surfaces[i].surf == surf) {
-			return &data->surfaces[i];
-		} else if (data->surfaces[i].surf == NULL && idx == OBJ_MAX) {
-			idx = i;
-		}
-	}
-	if (idx != OBJ_MAX) {
-		data->surfaces[idx].surf = surf;
-		return &data->surfaces[idx];
-	}
+	struct vk_surf_data *surf_data = malloc(sizeof(struct vk_surf_data));
+	if (surf_data) {
+		surf_data->surf = surf;
+		surf_data->hwnd = hwnd;
 
-	debug("find_surf_data failed, no more free slots");
-	return NULL;
+		AcquireSRWLockExclusive(&mutex);
+		struct vk_surf_data *next = data->surfaces;
+		surf_data->next = next;
+		data->surfaces = surf_data;
+		ReleaseSRWLockExclusive(&mutex);
+	}
+}
+
+static HWND find_surf_hwnd(struct vk_inst_data *data, VkSurfaceKHR surf)
+{
+	HWND hwnd = NULL;
+
+	AcquireSRWLockExclusive(&mutex);
+	struct vk_surf_data *surf_data = data->surfaces;
+	while (surf_data) {
+		if (surf_data->surf == surf) {
+			hwnd = surf_data->hwnd;
+			break;
+		}
+		surf_data = surf_data->next;
+	}
+	ReleaseSRWLockExclusive(&mutex);
+
+	return hwnd;
+}
+
+static void erase_surf_data(struct vk_inst_data *data, VkSurfaceKHR surf)
+{
+	AcquireSRWLockExclusive(&mutex);
+	struct vk_surf_data *current = data->surfaces;
+	if (current->surf == surf) {
+		data->surfaces = current->next;
+	} else {
+		struct vk_surf_data *previous;
+		do {
+			previous = current;
+			current = current->next;
+		} while (current && current->surf != surf);
+
+		if (current)
+			previous->next = current->next;
+	}
+	ReleaseSRWLockExclusive(&mutex);
+
+	free(current);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -343,53 +372,13 @@ static void remove_instance(void *inst)
 	struct vk_inst_data *data = &inst_data[idx];
 	memset(data, 0, sizeof(*data));
 
-	EnterCriticalSection(&mutex);
+	AcquireSRWLockExclusive(&mutex);
 	instances[idx] = NULL;
-	LeaveCriticalSection(&mutex);
+	ReleaseSRWLockExclusive(&mutex);
 }
 
 /* ======================================================================== */
 /* capture                                                                  */
-
-static bool vk_register_window(void)
-{
-	WNDCLASSW wc = {0};
-	wc.style = CS_OWNDC;
-	wc.hInstance = GetModuleHandle(NULL);
-	wc.lpfnWndProc = DefWindowProc;
-	wc.lpszClassName = DUMMY_WINDOW_CLASS_NAME;
-
-	if (!RegisterClassW(&wc)) {
-		flog("failed to register window class: %d", GetLastError());
-		return false;
-	}
-
-	return true;
-}
-
-static inline bool vk_shtex_init_window(struct vk_data *data)
-{
-	static bool registered = false;
-	if (!registered) {
-		static bool failure = false;
-		if (failure || !vk_register_window()) {
-			failure = true;
-			return false;
-		}
-		registered = true;
-	}
-
-	data->dummy_hwnd = CreateWindowExW(
-		0, DUMMY_WINDOW_CLASS_NAME, L"Dummy VK window, ignore",
-		WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, 0, 0, 2, 2, NULL,
-		NULL, GetModuleHandle(NULL), NULL);
-	if (!data->dummy_hwnd) {
-		flog("failed to create window: %d", GetLastError());
-		return false;
-	}
-
-	return true;
-}
 
 static inline bool vk_shtex_init_d3d11(struct vk_data *data)
 {
@@ -410,16 +399,6 @@ static inline bool vk_shtex_init_d3d11(struct vk_data *data)
 		return false;
 	}
 
-	DXGI_SWAP_CHAIN_DESC desc = {0};
-	desc.BufferCount = 2;
-	desc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-	desc.BufferDesc.Width = 2;
-	desc.BufferDesc.Height = 2;
-	desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-	desc.SampleDesc.Count = 1;
-	desc.Windowed = true;
-	desc.OutputWindow = data->dummy_hwnd;
-
 	HRESULT(WINAPI * create_factory)
 	(REFIID, void **) = (void *)GetProcAddress(dxgi, "CreateDXGIFactory1");
 	if (!create_factory) {
@@ -428,10 +407,10 @@ static inline bool vk_shtex_init_d3d11(struct vk_data *data)
 		return false;
 	}
 
-	PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN create =
-		(void *)GetProcAddress(d3d11, "D3D11CreateDeviceAndSwapChain");
+	PFN_D3D11_CREATE_DEVICE create =
+		(void *)GetProcAddress(d3d11, "D3D11CreateDevice");
 	if (!create) {
-		flog("failed to get D3D11CreateDeviceAndSwapChain address: %d",
+		flog("failed to get D3D11CreateDevice address: %d",
 		     GetLastError());
 		return false;
 	}
@@ -460,8 +439,8 @@ static inline bool vk_shtex_init_d3d11(struct vk_data *data)
 
 	hr = create(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, feature_levels,
 		    sizeof(feature_levels) / sizeof(D3D_FEATURE_LEVEL),
-		    D3D11_SDK_VERSION, &desc, &data->dxgi_swap,
-		    &data->d3d11_device, &level_used, &data->d3d11_context);
+		    D3D11_SDK_VERSION, &data->d3d11_device, &level_used,
+		    &data->d3d11_context);
 	IDXGIAdapter_Release(adapter);
 
 	if (FAILED(hr)) {
@@ -484,8 +463,8 @@ static inline bool vk_shtex_init_d3d11_tex(struct vk_data *data,
 	desc.MipLevels = 1;
 	desc.ArraySize = 1;
 
-	flog("OBS requesting %s texture format",
-	     vk_format_to_str(swap->format));
+	flog("OBS requesting %s texture format.  capture dimensions: %dx%d",
+	     vk_format_to_str(swap->format), (int)desc.Width, (int)desc.Height);
 
 	desc.Format = vk_format_to_dxgi(swap->format);
 	desc.SampleDesc.Count = 1;
@@ -559,7 +538,7 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data,
 	res = funcs->CreateImage(data->device, &ici, NULL, &swap->export_image);
 	if (VK_SUCCESS != res) {
 		flog("failed to CreateImage: %s", result_to_str(res));
-		swap->export_image = NULL;
+		swap->export_image = VK_NULL_HANDLE;
 		return false;
 	}
 
@@ -615,7 +594,7 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data,
 	if (mem_type_idx == pdmp.memoryTypeCount) {
 		flog("failed to get memory type index");
 		funcs->DestroyImage(data->device, swap->export_image, NULL);
-		swap->export_image = NULL;
+		swap->export_image = VK_NULL_HANDLE;
 		return false;
 	}
 
@@ -652,7 +631,7 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data,
 	if (VK_SUCCESS != res) {
 		flog("failed to AllocateMemory: %s", result_to_str(res));
 		funcs->DestroyImage(data->device, swap->export_image, NULL);
-		swap->export_image = NULL;
+		swap->export_image = VK_NULL_HANDLE;
 		return false;
 	}
 
@@ -677,7 +656,7 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data,
 		     use_bi2 ? "BindImageMemory2" : "BindImageMemory",
 		     result_to_str(res));
 		funcs->DestroyImage(data->device, swap->export_image, NULL);
-		swap->export_image = NULL;
+		swap->export_image = VK_NULL_HANDLE;
 		return false;
 	}
 	return true;
@@ -686,9 +665,6 @@ static inline bool vk_shtex_init_vulkan_tex(struct vk_data *data,
 static bool vk_shtex_init(struct vk_data *data, HWND window,
 			  struct vk_swap_data *swap)
 {
-	if (!vk_shtex_init_window(data)) {
-		return false;
-	}
 	if (!vk_shtex_init_d3d11(data)) {
 		return false;
 	}
@@ -840,7 +816,10 @@ static void vk_shtex_capture(struct vk_data *data,
 
 	VkCommandBuffer cmd_buffer = pool_data->cmd_buffers[image_index];
 	res = funcs->BeginCommandBuffer(cmd_buffer, &begin_info);
+
+#ifdef MORE_DEBUGGING
 	debug_res("BeginCommandBuffer", res);
+#endif
 
 	/* ------------------------------------------------------ */
 	/* transition shared texture if necessary                 */
@@ -974,24 +953,18 @@ static void vk_shtex_capture(struct vk_data *data,
 
 	VkFence fence = pool_data->fences[image_index];
 	res = funcs->QueueSubmit(queue, 1, &submit_info, fence);
+
+#ifdef MORE_DEBUGGING
 	debug_res("QueueSubmit", res);
+#endif
 
 	if (res == VK_SUCCESS)
 		pool_data->cmd_buffer_busy[image_index] = true;
 }
 
-static inline HWND get_swap_window(struct vk_swap_data *swap)
+static inline bool valid_rect(struct vk_swap_data *swap)
 {
-	for (size_t i = 0; i < OBJ_MAX; i++) {
-		struct vk_surf_data *surf_data =
-			find_surf_data(&inst_data[i], swap->surf);
-
-		if (!!surf_data && surf_data->surf == swap->surf) {
-			return surf_data->hwnd;
-		}
-	}
-
-	return NULL;
+	return !!swap->image_extent.width && !!swap->image_extent.height;
 }
 
 static void vk_capture(struct vk_data *data, VkQueue queue,
@@ -1001,15 +974,17 @@ static void vk_capture(struct vk_data *data, VkQueue queue,
 	HWND window = NULL;
 	uint32_t idx = 0;
 
+#ifdef MORE_DEBUGGING
 	debug("QueuePresentKHR called on "
 	      "devicekey %p, swapchain count %d",
 	      &data->funcs, info->swapchainCount);
+#endif
 
 	/* use first swap chain associated with a window */
 	for (; idx < info->swapchainCount; idx++) {
 		struct vk_swap_data *cur_swap =
 			get_swap_data(data, info->pSwapchains[idx]);
-		window = get_swap_window(cur_swap);
+		window = cur_swap->hwnd;
 		if (!!window) {
 			swap = cur_swap;
 			break;
@@ -1024,9 +999,10 @@ static void vk_capture(struct vk_data *data, VkQueue queue,
 		vk_shtex_free(data);
 	}
 	if (capture_should_init()) {
-		if (!vk_shtex_init(data, window, swap)) {
+		if (valid_rect(swap) && !vk_shtex_init(data, window, swap)) {
 			vk_shtex_free(data);
 			data->valid = false;
+			flog("vk_shtex_init failed");
 		}
 	}
 	if (capture_ready()) {
@@ -1091,11 +1067,22 @@ static VkResult VKAPI OBS_CreateInstance(const VkInstanceCreateInfo *cinfo,
 	/* (HACK) Set api version to 1.1 if set to 1.0              */
 	/* We do this to get our extensions working properly        */
 
-	VkApplicationInfo ai = *info.pApplicationInfo;
-	if (ai.apiVersion < VK_API_VERSION_1_1) {
-		info.pApplicationInfo = &ai;
+	VkApplicationInfo ai;
+	if (info.pApplicationInfo) {
+		ai = *info.pApplicationInfo;
+		if (ai.apiVersion < VK_API_VERSION_1_1)
+			ai.apiVersion = VK_API_VERSION_1_1;
+	} else {
+		ai.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+		ai.pNext = NULL;
+		ai.pApplicationName = NULL;
+		ai.applicationVersion = 0;
+		ai.pEngineName = NULL;
+		ai.engineVersion = 0;
 		ai.apiVersion = VK_API_VERSION_1_1;
 	}
+
+	info.pApplicationInfo = &ai;
 
 	/* -------------------------------------------------------- */
 	/* create instance                                          */
@@ -1125,6 +1112,7 @@ static VkResult VKAPI OBS_CreateInstance(const VkInstanceCreateInfo *cinfo,
 	GETADDR(GetInstanceProcAddr);
 	GETADDR(DestroyInstance);
 	GETADDR(CreateWin32SurfaceKHR);
+	GETADDR(DestroySurfaceKHR);
 	GETADDR(GetPhysicalDeviceMemoryProperties);
 	GETADDR(GetPhysicalDeviceImageFormatProperties2);
 #undef GETADDR
@@ -1304,6 +1292,7 @@ static VkResult VKAPI OBS_CreateDevice(VkPhysicalDevice phy_device,
 		goto fail;
 	}
 	if (!idata->valid) {
+		flog("instance not valid");
 		goto fail;
 	}
 
@@ -1317,6 +1306,7 @@ static VkResult VKAPI OBS_CreateDevice(VkPhysicalDevice phy_device,
 		goto fail;
 	}
 
+	data->inst_data = idata;
 	data->valid = true;
 
 fail:
@@ -1351,22 +1341,20 @@ OBS_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *cinfo,
 	struct vk_data *data = get_device_data(device);
 	struct vk_device_funcs *funcs = &data->funcs;
 
-	struct vk_swap_data *swap = get_new_swap_data(data);
-
-	swap->surf = cinfo->surface;
-	swap->image_extent = cinfo->imageExtent;
-	swap->format = cinfo->imageFormat;
-
 	VkSwapchainCreateInfoKHR info = *cinfo;
 	info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
 	VkResult res = funcs->CreateSwapchainKHR(device, &info, ac, p_sc);
+	debug_res("CreateSwapchainKHR", res);
+	if (res != VK_SUCCESS)
+		return res;
 	VkSwapchainKHR sc = *p_sc;
 
 	uint32_t count = 0;
 	res = funcs->GetSwapchainImagesKHR(data->device, sc, &count, NULL);
 	debug_res("GetSwapchainImagesKHR", res);
 
+	struct vk_swap_data *swap = get_new_swap_data(data);
 	if (count > 0) {
 		if (count > OBJ_MAX)
 			count = OBJ_MAX;
@@ -1374,11 +1362,15 @@ OBS_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *cinfo,
 		res = funcs->GetSwapchainImagesKHR(data->device, sc, &count,
 						   swap->swap_images);
 		debug_res("GetSwapchainImagesKHR", res);
-		swap->image_count = count;
 	}
 
 	swap->sc = sc;
-	return res;
+	swap->image_extent = cinfo->imageExtent;
+	swap->format = cinfo->imageFormat;
+	swap->hwnd = find_surf_hwnd(data->inst_data, cinfo->surface);
+	swap->image_count = count;
+
+	return VK_SUCCESS;
 }
 
 static void VKAPI OBS_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR sc,
@@ -1394,7 +1386,7 @@ static void VKAPI OBS_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR sc,
 		}
 
 		swap->sc = VK_NULL_HANDLE;
-		swap->surf = NULL;
+		swap->hwnd = NULL;
 	}
 
 	funcs->DestroySwapchainKHR(device, sc, ac);
@@ -1428,13 +1420,19 @@ static VkResult VKAPI OBS_CreateWin32SurfaceKHR(
 	struct vk_inst_funcs *funcs = &data->funcs;
 
 	VkResult res = funcs->CreateWin32SurfaceKHR(inst, info, ac, surf);
-	if (NULL != surf && VK_NULL_HANDLE != *surf) {
-		struct vk_surf_data *surf_data = find_surf_data(data, *surf);
-
-		surf_data->hinstance = info->hinstance;
-		surf_data->hwnd = info->hwnd;
-	}
+	if (res == VK_SUCCESS)
+		insert_surf_data(data, *surf, info->hwnd);
 	return res;
+}
+
+static void VKAPI OBS_DestroySurfaceKHR(VkInstance inst, VkSurfaceKHR surf,
+					const VkAllocationCallbacks *ac)
+{
+	struct vk_inst_data *data = get_inst_data(inst);
+	struct vk_inst_funcs *funcs = &data->funcs;
+
+	erase_surf_data(data, surf);
+	funcs->DestroySurfaceKHR(inst, surf, ac);
 }
 
 #define GETPROCADDR(func)              \
@@ -1470,6 +1468,7 @@ static VkFunc VKAPI OBS_GetInstanceProcAddr(VkInstance inst, const char *name)
 	GETPROCADDR(CreateInstance);
 	GETPROCADDR(DestroyInstance);
 	GETPROCADDR(CreateWin32SurfaceKHR);
+	GETPROCADDR(DestroySurfaceKHR);
 
 	/* device chain functions we intercept */
 	GETPROCADDR(GetDeviceProcAddr);
@@ -1511,23 +1510,4 @@ bool hook_vulkan(void)
 		hooked = true;
 	}
 	return hooked;
-}
-
-static bool vulkan_initialized = false;
-
-bool init_vk_layer()
-{
-	if (!vulkan_initialized) {
-		InitializeCriticalSection(&mutex);
-		vulkan_initialized = true;
-	}
-	return true;
-}
-
-bool shutdown_vk_layer()
-{
-	if (vulkan_initialized) {
-		DeleteCriticalSection(&mutex);
-	}
-	return true;
 }

@@ -6,6 +6,7 @@ struct vk_inst_funcs {
 	DEF_FUNC(GetInstanceProcAddr);
 	DEF_FUNC(DestroyInstance);
 	DEF_FUNC(CreateWin32SurfaceKHR);
+	DEF_FUNC(DestroySurfaceKHR);
 	DEF_FUNC(GetPhysicalDeviceMemoryProperties);
 	DEF_FUNC(GetPhysicalDeviceImageFormatProperties2);
 };
@@ -457,6 +458,7 @@ DXGI_FORMAT vk_format_to_dxgi(VkFormat format)
 		dxgi_format = DXGI_FORMAT_B8G8R8A8_UNORM;
 		break;
 	case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+		dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 		break;
 	case VK_FORMAT_A8B8G8R8_SNORM_PACK32:
 		break;
@@ -848,6 +850,7 @@ DXGI_FORMAT vk_format_to_dxgi(VkFormat format)
 }
 
 //#define DEBUG_PRINT
+//#define MORE_DEBUGGING
 //#define DEBUG_PRINT_PROCADDR
 
 #ifdef DEBUG_PRINT
