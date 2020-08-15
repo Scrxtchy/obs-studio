@@ -107,7 +107,7 @@ static void stinger_update(void *data, obs_data_t *settings)
 		obs_data_set_string(tm_media_settings, "local_file", tm_path);
 
 		s->matte_source = obs_source_create_private(
-			"ffmpeg_source", NULL, tm_media_settings);
+			"ffmpeg_source", "track_matte", tm_media_settings);
 		obs_data_release(tm_media_settings);
 
 		// no need to output sound from the matte video
